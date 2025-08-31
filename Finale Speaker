@@ -1,0 +1,315 @@
+# dofus_npc_speaker_gui.py
+import time
+import re
+import threading
+import queue
+import pymem
+import pymem.process
+import pyttsx3
+import keyboard   # pip install keyboard
+import tkinter as tk
+
+PROCESS = "Dofus.exe"
+
+# --- Confirmed pointer chain ---
+CHAIN = {
+    "module": "GameAssembly.dll",
+    "base_offset": 0x05D93528,      # GameAssembly.dll+05D93528
+    "hops": [0xB8, 0x20, 0x10],     # +B8 -> +20 -> +10 (each hop: add then deref)
+    "tail_offset": 0x20,            # final +20
+    "base_deref_first": True,       # ✅ working combo
+    "tail_is_pointer": False        # ✅ working combo
+}
+
+# ---------- TTS ----------
+def init_tts():
+    eng = pyttsx3.init()
+    chosen = None
+    for v in eng.getProperty("voices"):
+        name = (v.name or "").lower()
+        langs = [str(x).lower() for x in (v.languages or [])]
+        if "fr" in name or any("fr" in l for l in langs):
+            chosen = v.id
+            break
+    if chosen:
+        eng.setProperty("voice", chosen)
+    eng.setProperty("rate", 165)
+    eng.setProperty("volume", 1.0)
+    return eng
+
+engine = init_tts()
+
+def speak(text: str):
+    try:
+        engine.say(text)
+        engine.runAndWait()
+    except Exception:
+        # very rarely pyttsx3 can hiccup; ignore and keep running
+        pass
+
+# ---------- Memory helpers ----------
+def r64(pm, addr):
+    return pm.read_longlong(addr)
+
+def resolve_pre_tail(pm):
+    mod = pymem.process.module_from_name(pm.process_handle, CHAIN["module"])
+    addr = mod.lpBaseOfDll + CHAIN["base_offset"]
+    if CHAIN["base_deref_first"]:
+        addr = r64(pm, addr)
+    for off in CHAIN["hops"]:
+        addr = r64(pm, addr + off)
+    return addr
+
+def read_utf16(pm, addr, n=4096):
+    raw = pm.read_bytes(addr, n)
+    raw = raw.split(b"\x00\x00", 1)[0]
+    return raw.decode("utf-16le", errors="ignore")
+
+# ---------- Cleaner ----------
+TAG_RE  = re.compile(r"<[^>]+>")
+TS_RE   = re.compile(r"\[\d{2}:\d{2}\]")
+RESIDUAL_TAG_RE = re.compile(r"/[biu]>|</?[biu]>|</?color[^>]*>|</?link[^>]*>", re.IGNORECASE)
+SENT_SPLIT = re.compile(r'(?<=[\.\!\?…])\s+')
+
+def ensure_space_after_punct(text: str) -> str:
+    return re.sub(r'([\.!\?…])(?=\S)', r'\1 ', text)
+
+def clean_npc_text(buf: str, max_sentences: int = 2) -> str:
+    first_tag = buf.find("<")
+    first_chat = buf.find("\n[")
+    true_pos = buf.find('True">')
+    stops = [p for p in (first_tag, first_chat, true_pos) if p != -1]
+    if stops:
+        buf = buf[:min(stops)]
+
+    buf = TAG_RE.sub("", buf)
+    buf = RESIDUAL_TAG_RE.sub("", buf)
+    buf = buf.replace("\r\n", "\n").replace("\r", "\n")
+
+    kept_lines = []
+    for line in buf.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if TS_RE.search(s):
+            continue
+        if "http://" in s or "https://" in s:
+            continue
+        if "Bienvenue dans DOFUS" in s:
+            continue
+        kept_lines.append(s)
+
+    text = " ".join(kept_lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace("..", ".").replace(" .", ".")
+    text = ensure_space_after_punct(text)
+
+    sentences = SENT_SPLIT.split(text)
+    result = []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if s.startswith((",", "]", "[", "<")):
+            break
+        if "link=" in s or "color=" in s:
+            break
+        if s[0].isalpha() and s[0].islower():
+            break
+        result.append(s)
+        if len(result) >= max_sentences:
+            break
+
+    clean = " ".join(result).strip()
+    clean = re.sub(r"[0-9A-Fa-f]{2,}>\s*$", "", clean)
+    return clean
+
+# ---------- Worker thread ----------
+class SpeakerWorker(threading.Thread):
+    def __init__(self, ui_queue):
+        super().__init__(daemon=True)
+        self.ui_queue = ui_queue
+        self.enabled = True
+        self.force_reset = False
+
+        # speaking state
+        self.last_spoken = ""
+        self.stable_text = ""
+        self.stable_count = 0
+
+        # allow re-speaking the exact same line after genuine blank/reset
+        self.can_repeat_same = True
+        self.blank_frames = 0
+
+        # tuned gates
+        self.BLANK_THRESHOLD = 3        # frames of blank = dialogue closed
+        self.STABILITY_FRAMES = 2       # need same cleaned text for 2 frames
+        self.SPEAK_COOLDOWN = 0.8       # seconds between speeches
+        self.last_speak_ts = 0.0
+
+        # edge change debounce (speak after short dwell even if no blanks)
+        self.pending_text = ""
+        self.pending_since = 0.0
+        self.MIN_DWELL = 0.20           # seconds new text must persist
+
+        self.pm = None
+
+    def send_ui(self, **payload):
+        self.ui_queue.put(payload)
+
+    def run(self):
+        try:
+            self.pm = pymem.Pymem(PROCESS)
+            base = pymem.process.module_from_name(self.pm.process_handle, CHAIN["module"]).lpBaseOfDll
+            self.send_ui(status=f"Attached. {CHAIN['module']} @ 0x{base:X}")
+        except Exception as e:
+            self.send_ui(status=f"Failed to attach: {e}")
+            return
+
+        keyboard.add_hotkey("f9", self.toggle_enable)
+        keyboard.add_hotkey("f10", self.reset_session)
+
+        while True:
+            if self.force_reset:
+                self._reset_state(allow_same=True)
+                self.force_reset = False
+                self.send_ui(event="reset")
+
+            # read & clean
+            try:
+                pre_tail = resolve_pre_tail(self.pm)
+                string_addr = (
+                    r64(self.pm, pre_tail + CHAIN["tail_offset"])
+                    if CHAIN["tail_is_pointer"] else
+                    (pre_tail + CHAIN["tail_offset"])
+                )
+                raw = read_utf16(self.pm, string_addr)
+            except Exception:
+                raw = ""
+
+            npc = clean_npc_text(raw)
+            preview = npc if len(npc) < 160 else (npc[:157] + "…")
+            self.send_ui(text_preview=preview, enabled=self.enabled)
+
+            # blank tracking to allow repeating same line after real close
+            if not npc:
+                self.blank_frames = min(self.BLANK_THRESHOLD, self.blank_frames + 1)
+                if self.blank_frames >= self.BLANK_THRESHOLD:
+                    self.can_repeat_same = True
+                    self.stable_text = ""
+                    self.stable_count = 0
+                    self.pending_text = ""
+                    self.pending_since = 0.0
+                time.sleep(0.10)
+                continue
+            else:
+                self.blank_frames = 0
+
+            # stability (frame-based)
+            if npc == self.stable_text:
+                self.stable_count += 1
+            else:
+                self.stable_text = npc
+                self.stable_count = 1
+
+            # edge-dwell debounce: speak after MIN_DWELL if text changed
+            now = time.time()
+            if npc != self.pending_text:
+                self.pending_text = npc
+                self.pending_since = now
+
+            dwell_ok = (now - self.pending_since) >= self.MIN_DWELL
+            stable_ok = self.stable_count >= self.STABILITY_FRAMES
+            cooldown_ok = (now - self.last_speak_ts) >= self.SPEAK_COOLDOWN
+
+            # Speak if new text (different than last spoken) and it’s either stable or lived MIN_DWELL
+            should_speak = self.enabled and cooldown_ok and \
+                           ((npc != self.last_spoken) and (stable_ok or dwell_ok) or
+                            (self.can_repeat_same and (stable_ok or dwell_ok)))
+
+            if should_speak:
+                self.last_spoken = npc
+                self.last_speak_ts = now
+                self.can_repeat_same = False
+                self.send_ui(spoken=npc)
+                speak(npc)
+
+            time.sleep(0.08)
+
+    def _reset_state(self, allow_same: bool):
+        self.last_spoken = ""
+        self.stable_text = ""
+        self.stable_count = 0
+        self.blank_frames = 0
+        self.pending_text = ""
+        self.pending_since = 0.0
+        self.can_repeat_same = allow_same
+
+    def toggle_enable(self):
+        self.enabled = not self.enabled
+        self.send_ui(enabled=self.enabled)
+
+    def reset_session(self):
+        self.force_reset = True
+
+# ---------- GUI ----------
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Dofus NPC Speaker")
+        self.root.attributes("-topmost", True)
+        self.root.geometry("520x220")
+
+        self.status_var = tk.StringVar(value="Attaching...")
+        self.enabled_var = tk.StringVar(value="ON")
+        self.text_var = tk.StringVar(value="(waiting for dialogue)")
+
+        tk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=8, pady=(8, 4))
+        tk.Label(self.root, text="Hotkeys: F9 toggle | F10 reset | Close window to quit", fg="#666").pack(padx=8, pady=(0, 8))
+
+        row = tk.Frame(self.root)
+        row.pack(fill="x", padx=8)
+        tk.Label(row, text="Status:").pack(side="left")
+        self.enabled_lbl = tk.Label(row, textvariable=self.enabled_var, fg="#0a0")
+        self.enabled_lbl.pack(side="left", padx=6)
+
+        tk.Label(self.root, text="Last line:").pack(anchor="w", padx=8, pady=(10, 2))
+        self.text_lbl = tk.Label(self.root, textvariable=self.text_var, wraplength=500, justify="left")
+        self.text_lbl.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        self.ui_queue = queue.Queue()
+        self.worker = SpeakerWorker(self.ui_queue)
+        self.worker.start()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(100, self.pump_ui)
+
+    def pump_ui(self):
+        try:
+            while True:
+                msg = self.ui_queue.get_nowait()
+                if "status" in msg:
+                    self.status_var.set(msg["status"])
+                if "enabled" in msg:
+                    on = msg["enabled"]
+                    self.enabled_var.set("ON" if on else "OFF")
+                    self.enabled_lbl.config(fg="#0a0" if on else "#777")
+                if "text_preview" in msg:
+                    self.text_var.set(msg["text_preview"] or "(waiting for dialogue)")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.pump_ui)
+
+    def on_close(self):
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        self.root.destroy()
+
+def main():
+    app = App()
+    app.root.mainloop()
+
+if __name__ == "__main__":
+    main()
