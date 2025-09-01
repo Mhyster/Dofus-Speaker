@@ -1,0 +1,776 @@
+# dofus_npc_speaker_gui.py
+import time
+import threading
+import queue
+import subprocess
+import base64
+import os
+import tempfile
+import sys
+import json
+import hashlib
+from typing import Optional, List, Tuple
+
+import pymem
+import pymem.process
+import keyboard
+import tkinter as tk
+from tkinter import ttk
+
+import requests
+import winsound
+import re
+from ctypes import windll, create_unicode_buffer  # for MCI + short path helpers
+
+# =========================================================
+# Config
+# =========================================================
+PROCESS = "Dofus.exe"
+CHAIN = {
+    "module": "GameAssembly.dll",
+    "base_offset": 0x05D93528,
+    "hops": [0xB8, 0x20, 0x10],
+    "tail_offset": 0x20,
+    "base_deref_first": True,
+    "tail_is_pointer": False,
+}
+
+HASHMAP_PATH = r"C:\dofus3-data\Finale\dialogs_hashedwithgender.json"  # NEW: your file
+TTS_CACHE_DIR = r"C:\dofus3-data\tts_cache"
+
+# Voices you want per gender
+VOICE_BY_GENDER = {
+    0: "onyx",  # male
+    1: "nova",  # female
+}
+
+# =========================================================
+# Memory helpers
+# =========================================================
+def r64(pm, addr):
+    return pm.read_longlong(addr)
+
+def resolve_pre_tail(pm):
+    mod = pymem.process.module_from_name(pm.process_handle, CHAIN["module"])
+    addr = mod.lpBaseOfDll + CHAIN["base_offset"]
+    if CHAIN["base_deref_first"]:
+        addr = r64(pm, addr)
+    for off in CHAIN["hops"]:
+        addr = r64(pm, addr + off)
+    return addr
+
+def read_utf16_string(pm, addr, cap=4096):
+    """Read raw UTF-16LE string from memory (no regex cleaning)."""
+    size = 128
+    out = b""
+    while size <= cap:
+        try:
+            chunk = pm.read_bytes(addr, size)
+        except Exception:
+            break
+        end = chunk.find(b"\x00\x00")
+        if end != -1:
+            out = chunk[:end]
+            break
+        size *= 2
+        out = chunk
+    try:
+        return out.decode("utf-16le", errors="ignore")
+    except Exception:
+        return ""
+
+# =========================================================
+# Dialog cleaning / normalization
+# =========================================================
+TAG_RE = re.compile(r"<[^>]+>")
+TS_RE = re.compile(r"\[\d{2}:\d{2}\]")  # [mm:ss]-style stamps
+
+def normalize_dialog(text: str) -> str:
+    """Collapse whitespace and strip; remove tags and [mm:ss]."""
+    if not text:
+        return ""
+    s = TAG_RE.sub("", text)
+    s = TS_RE.sub("", s)
+    s = " ".join(s.split()).strip()
+    return s
+
+def clean_dialogs(raw: str) -> list[str]:
+    """Split raw capture into plausible dialog segments and trim."""
+    if not raw:
+        return []
+    parts = raw.split("\x00")
+    results: list[str] = []
+    for p in parts:
+        if not p.strip():
+            continue
+        c = normalize_dialog(p)
+        if c:
+            # Take up to the first sentence-ending punctuation if missing space after it.
+            n = len(c); i = 0; cut_pos = -1
+            while i < n:
+                ch = c[i]
+                if ch == '.' and i + 2 < n and c[i+1] == '.' and c[i+2] == '.':
+                    next_ch = c[i+3] if (i + 3) < n else None
+                    if next_ch is None or not next_ch.isspace():
+                        cut_pos = i + 2
+                        break
+                    i += 3; continue
+                if ch in '.!?':
+                    next_ch = c[i+1] if (i + 1) < n else None
+                    if next_ch is None or not next_ch.isspace():
+                        cut_pos = i
+                        break
+                i += 1
+            seg = c if cut_pos == -1 else c[:cut_pos + 1]
+            seg = seg.strip()
+            if seg:
+                results.append(seg)
+    return results
+
+# =========================================================
+# Load hashed-with-gender map and build lookups
+# =========================================================
+HASH_TO_GENDER: dict[str, int] = {}
+
+def text_to_hash(text: str) -> str:
+    """Convert text to SHA-256 hash for lookup in the hashmap."""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def load_hashed_map(path: str):
+    """Load {hash: {text, gender}} and build fast lookups."""
+    global HASH_TO_GENDER
+    HASH_TO_GENDER = {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Could not load hashed dialog map at {path}: {e}")
+        return
+
+    if not isinstance(data, dict):
+        print("[WARN] Hashed map is not a dict; skipping.")
+        return
+
+    added = 0
+    for hash_key, payload in data.items():
+        if not isinstance(payload, dict):
+            continue
+        gender = payload.get("gender")
+        if gender in (0, 1):
+            HASH_TO_GENDER[hash_key] = gender
+            added += 1
+
+    print(f"[INFO] Loaded {added} entries from hashed-with-gender file.")
+
+def get_gender_for_dialog(candidate_text: str) -> Optional[int]:
+    """Return gender if candidate text hash matches a known line."""
+    if not candidate_text:
+        return None
+    
+    # Try exact text hash first
+    text_hash = text_to_hash(candidate_text)
+    gender = HASH_TO_GENDER.get(text_hash)
+    if gender in (0, 1):
+        return gender
+    
+    # Try normalized text hash as fallback
+    normalized_text = normalize_dialog(candidate_text)
+    if normalized_text != candidate_text:
+        norm_hash = text_to_hash(normalized_text)
+        gender = HASH_TO_GENDER.get(norm_hash)
+        if gender in (0, 1):
+            return gender
+    
+    return None
+
+# =========================================================
+# Robust Windows WAV playback (MCI + WPF fallback)
+# =========================================================
+def _get_short_path(path: str) -> str:
+    buf = create_unicode_buffer(32768)
+    if windll.kernel32.GetShortPathNameW(path, buf, len(buf)):
+        return buf.value
+    return path
+
+def _mci_error_text(code: int) -> str:
+    buf = create_unicode_buffer(256)
+    if windll.winmm.mciGetErrorStringW(code, buf, 255):
+        return buf.value
+    return f"MCI error {code}"
+
+def _stop_mci():
+    try:
+        windll.winmm.mciSendStringW("stop npc_tts", None, 0, 0)
+        windll.winmm.mciSendStringW("close npc_tts", None, 0, 0)
+    except Exception:
+        pass
+
+def _play_ps_mediaplayer(path: str):
+    try:
+        ps_exe = ["powershell", "-NoProfile", "-NonInteractive"]
+        ps_path = path.replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName PresentationCore;"
+            "$m = New-Object System.Windows.Media.MediaPlayer;"
+            "$uri = New-Object System.Uri ('file:///' + (Resolve-Path '{0}').Path.Replace('\\','/'));"
+            "$m.Open($uri);"
+            "for ($i=0; $i -lt 100; $i++) {{ if ($m.NaturalDuration.HasTimeSpan) {{ break }} Start-Sleep -Milliseconds 100 }};"
+            "$dur = 3.0; if ($m.NaturalDuration.HasTimeSpan) {{ $dur = [Math]::Max(0.5, $m.NaturalDuration.TimeSpan.TotalSeconds) }};"
+            "$m.Volume = 1.0; $m.Play(); Start-Sleep -Seconds $dur;"
+        ).format(ps_path)
+        enc = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        subprocess.Popen(ps_exe + ["-EncodedCommand", enc], creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        print(f"[Play] PowerShell MediaPlayer fallback failed: {e}", file=sys.stderr)
+
+def _play_wav_windows(path: str):
+    _stop_mci()
+    spath = _get_short_path(path).replace("\\", "/")
+    rc = windll.winmm.mciSendStringW(f'open "{spath}" alias npc_tts', None, 0, 0)
+    if rc != 0:
+        print(f"[Play] MCI open rc={rc} ({_mci_error_text(rc)}) path={spath}", file=sys.stderr)
+        _play_ps_mediaplayer(path)
+        return
+    windll.winmm.mciSendStringW("setaudio npc_tts volume to 1000", None, 0, 0)
+    rc = windll.winmm.mciSendStringW("play npc_tts", None, 0, 0)
+    if rc != 0:
+        print(f"[Play] MCI play rc={rc} ({_mci_error_text(rc)})", file=sys.stderr)
+        windll.winmm.mciSendStringW("close npc_tts", None, 0, 0)
+        _play_ps_mediaplayer(path)
+
+# =========================================================
+# OpenAI TTS client (fixed queue signature)
+# =========================================================
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini-tts"
+OPENAI_VOICES = [
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+    "coral", "verse", "ballad", "ash", "sage", "marin", "cedar",
+]
+
+DEFAULT_MALE_VOICE = "onyx"
+DEFAULT_FEMALE_VOICE = "nova"
+
+class OpenAITTSSpeaker:
+    """
+    Queue now stores tuples: (text, voice_override or None)
+    """
+    def __init__(self, api_key: str, model: str = OPENAI_DEFAULT_MODEL, voice: str = "alloy", persist_dir: Optional[str] = None):
+        self.api_key = (api_key or "").strip()
+        if not self.api_key:
+            raise RuntimeError("No OpenAI API key provided.")
+        self.model = model or OPENAI_DEFAULT_MODEL
+        self.voice = voice if voice in OPENAI_VOICES else OPENAI_VOICES[0]
+        self.endpoint = "https://api.openai.com/v1/audio/speech"
+        self.session = requests.Session()
+        self.q: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=8)
+        self._running = True
+        self.last_error = ""
+        self.last_path = ""
+        self.last_size = 0
+        self.last_ct = ""
+        self.persist_dir = persist_dir
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def list_voices(self) -> List[str]:
+        return OPENAI_VOICES
+
+    def set_voice(self, v: Optional[str]):
+        if v in OPENAI_VOICES:
+            self.voice = v
+
+    def set_model(self, m: str):
+        self.model = m or OPENAI_DEFAULT_MODEL
+
+    def set_api_key(self, key: str):
+        self.api_key = (key or "").strip()
+
+    def set_persist_dir(self, path: Optional[str]):
+        self.persist_dir = path
+
+    def speak(self, text: str, voice_override: Optional[str] = None):
+        if not text:
+            return
+        # Drop queued items to avoid overlap; keep only the latest
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.q.put_nowait((text, voice_override))
+        except queue.Full:
+            pass
+
+    def _synthesize(self, text: str, voice_override: Optional[str]) -> Optional[str]:
+        voice = voice_override if (voice_override in OPENAI_VOICES) else self.voice
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "voice": voice,
+            "input": text,
+            "response_format": "wav"
+        }
+        try:
+            with self.session.post(self.endpoint, json=payload, headers=headers, stream=True, timeout=60) as r:
+                if not r.ok:
+                    self.last_error = f"OpenAI TTS HTTP {r.status_code}: {r.text[:300]}"
+                    print(f"[OpenAI TTS] {self.last_error}", file=sys.stderr)
+                    return None
+                if self.persist_dir:
+                    os.makedirs(self.persist_dir, exist_ok=True)
+                    safe_snippet = "".join(ch for ch in text[:24] if ch.isalnum() or ch in (" ", "_", "-")).strip().replace(" ", "_")
+                    filename = f"tts_{int(time.time())}_{safe_snippet or 'line'}.wav"
+                    path = os.path.join(self.persist_dir, filename)
+                    f = open(path, "wb")
+                else:
+                    f = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    path = f.name
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+                f.close()
+        except Exception as e:
+            self.last_error = f"OpenAI request failed: {e}"
+            print(f"[OpenAI TTS] {self.last_error}", file=sys.stderr)
+            return None
+
+        # sanity-check WAV header
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(12)
+            if not (head.startswith(b"RIFF") and b"WAVE" in head):
+                self.last_error = f"Not RIFF/WAVE. Head={head!r}"
+                print(f"[OpenAI TTS] {self.last_error}", file=sys.stderr)
+                return None
+        except Exception as e:
+            self.last_error = f"WAV header read failed: {e}"
+            print(f"[OpenAI TTS] {self.last_error}", file=sys.stderr)
+            return None
+
+        try:
+            self.last_size = os.path.getsize(path)
+        except Exception:
+            self.last_size = 0
+        self.last_path = path
+        self.last_error = ""
+        return path
+
+    def _run(self):
+        while self._running:
+            try:
+                text, voice_override = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            path = self._synthesize(text, voice_override)
+            if not path:
+                continue
+            _play_wav_windows(path)
+
+    def stop(self):
+        self._running = False
+
+# =========================================================
+# Worker thread
+# =========================================================
+class SpeakerWorker(threading.Thread):
+    def __init__(self, ui_queue, speaker: Optional[OpenAITTSSpeaker]):
+        super().__init__(daemon=True)
+        self.ui_queue = ui_queue
+        self.speaker = speaker
+        self.running = True
+        self.pm = None
+        self.enabled = True
+        self.speak_unknown = False  # debug toggle
+        self.last_text = ""
+        self.last_spoken = ""
+        self.last_change_ts = 0.0
+        self.last_speak_ts = 0.0
+        self.DWELL = 0.16
+        self.COOLDOWN = 0.45
+        self.male_voice = DEFAULT_MALE_VOICE
+        self.female_voice = DEFAULT_FEMALE_VOICE
+
+    def send_ui(self, **payload):
+        self.ui_queue.put(payload)
+
+    def _attach_loop(self):
+        while self.running and self.pm is None:
+            try:
+                pm = pymem.Pymem(PROCESS)
+                base = pymem.process.module_from_name(pm.process_handle, CHAIN["module"]).lpBaseOfDll
+                self.pm = pm
+                self.send_ui(status=f"Attached. {CHAIN['module']} @ 0x{base:X}")
+                return
+            except Exception as e:
+                self.send_ui(status=f"Waiting for {PROCESS}… ({e})")
+                time.sleep(1.0)
+
+    def run(self):
+        self._attach_loop()
+        poll_sleep = 0.20
+
+        while self.running:
+            if self.pm is None:
+                self._attach_loop()
+                time.sleep(0.2)
+                continue
+
+            try:
+                pre_tail = resolve_pre_tail(self.pm)
+                string_addr = (r64(self.pm, pre_tail + CHAIN["tail_offset"])
+                               if CHAIN["tail_is_pointer"]
+                               else (pre_tail + CHAIN["tail_offset"]))
+                raw = read_utf16_string(self.pm, string_addr)
+                if raw:
+                    print(f"[DEBUG RAW MEM] {raw[:200]!r}")
+                else:
+                    print("[DEBUG RAW MEM] EMPTY")
+                dialogs = clean_dialogs(raw)
+                print(f"[DEBUG CLEANED] {dialogs}")
+            except Exception as e:
+                self.send_ui(status=f"Read error: {e}")
+                try:
+                    self.pm.close_process()
+                except Exception:
+                    pass
+                self.pm = None
+                time.sleep(0.5)
+                continue
+
+            for candidate in dialogs:
+                raw_candidate = candidate
+                candidate_norm = normalize_dialog(candidate)
+                if not candidate_norm:
+                    continue
+
+                print(f"[DEBUG RAW] {raw_candidate!r}")
+                print(f"[DEBUG NORM] {candidate_norm!r}")
+
+                gender = get_gender_for_dialog(raw_candidate)
+                if gender not in (0, 1):
+                    gender = get_gender_for_dialog(candidate_norm)
+
+                if gender not in (0, 1):
+                    print("[DEBUG] Not in hashed map -> skipping" + (" (debug speak ON)" if self.speak_unknown else ""))
+                    if self.speak_unknown and self.speaker and self.enabled:
+                        # speak unknown with default voice
+                        self._maybe_speak(candidate_norm, None)
+                    continue
+
+                # Known line – pick the proper voice without mutating default
+                voice = VOICE_BY_GENDER.get(gender, None)
+                self._maybe_speak(candidate_norm, voice)
+
+                time.sleep(poll_sleep)
+
+    def _maybe_speak(self, text: str, voice_override: Optional[str]):
+        self.send_ui(text_preview=text, enabled=self.enabled)
+        now = time.time()
+        dwell_ok = (now - self.last_change_ts) >= self.DWELL
+        cooldown_ok = (now - self.last_speak_ts) >= self.COOLDOWN
+        should_speak = (
+            self.enabled
+            and cooldown_ok
+            and dwell_ok
+            and text != self.last_spoken
+            and self.speaker is not None
+        )
+
+        if text != self.last_text:
+            self.last_text = text
+            self.last_change_ts = now
+
+        if should_speak:
+            self.last_spoken = text
+            self.last_speak_ts = now
+            self.send_ui(spoken=text)
+            print(f"[SELECTED] {text}")
+            self.speaker.speak(text, voice_override)
+
+    def stop(self):
+        self.running = False
+
+# =========================================================
+# GUI
+# =========================================================
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Dofus NPC Speaker")
+        self.root.attributes("-topmost", True)
+        self.root.geometry("920x520")
+
+        # --- API Key row ---
+        keyrow = ttk.Frame(self.root); keyrow.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(keyrow, text="OpenAI API key:").pack(side="left")
+        self.key_var = tk.StringVar(value=os.getenv("OPENAI_API_KEY", ""))
+        self.key_entry = ttk.Entry(keyrow, textvariable=self.key_var, width=56, show="•" if self.key_var.get() else "")
+        self.key_entry.pack(side="left", padx=(6, 6))
+        self.key_show_var = tk.BooleanVar(value=False)
+        def toggle_show():
+            self.key_entry.configure(show="" if self.key_show_var.get() else "•")
+        ttk.Checkbutton(keyrow, text="Show", variable=self.key_show_var, command=toggle_show).pack(side="left", padx=(0,8))
+
+        self.key_apply_btn = ttk.Button(keyrow, text="Apply API key", command=self.apply_api_key)
+        self.key_apply_btn.pack(side="left", padx=(0,8))
+
+        # Persist WAVs toggle + open folder
+        self.save_wav_var = tk.BooleanVar(value=False)
+        self.save_wav_chk = ttk.Checkbutton(keyrow, text="Save WAVs", variable=self.save_wav_var, command=self.on_save_wav_toggle)
+        self.save_wav_chk.pack(side="left", padx=(8, 4))
+        self.open_folder_btn = ttk.Button(keyrow, text="Open folder", command=self.open_wav_folder)
+        self.open_folder_btn.pack(side="left")
+
+        # --- Top toolbar (voice/model/speak/test) ---
+        top = ttk.Frame(self.root); top.pack(fill="x", padx=8, pady=(8, 4))
+
+        ttk.Label(top, text="Male voice:").pack(side="left")
+        self.male_voice_var = tk.StringVar(value=DEFAULT_MALE_VOICE)
+        self.male_voice_cb = ttk.Combobox(top, values=OPENAI_VOICES, textvariable=self.male_voice_var, width=10, state="readonly")
+        self.male_voice_cb.pack(side="left", padx=(4, 10))
+
+        ttk.Label(top, text="Female voice:").pack(side="left")
+        self.female_voice_var = tk.StringVar(value=DEFAULT_FEMALE_VOICE)
+        self.female_voice_cb = ttk.Combobox(top, values=OPENAI_VOICES, textvariable=self.female_voice_var, width=10, state="readonly")
+        self.female_voice_cb.pack(side="left", padx=(4, 10))
+
+        ttk.Label(top, text="Default voice:").pack(side="left")
+        self.voice_var = tk.StringVar(value="alloy")
+        self.voice_cb = ttk.Combobox(top, values=OPENAI_VOICES, textvariable=self.voice_var, width=12, state="readonly")
+        self.voice_cb.pack(side="left", padx=(4, 10))
+
+        ttk.Label(top, text="Model:").pack(side="left")
+        self.model_var = tk.StringVar(value=OPENAI_DEFAULT_MODEL)
+        self.model_entry = ttk.Entry(top, textvariable=self.model_var, width=28)
+        self.model_entry.pack(side="left", padx=(4, 10))
+
+        self.enabled_var = tk.BooleanVar(value=True)
+        self.enabled_chk = ttk.Checkbutton(top, text="Speak", variable=self.enabled_var, command=self.on_enabled_toggle)
+        self.enabled_chk.pack(side="left", padx=(0, 10))
+
+        self.spk_unknown_var = tk.BooleanVar(value=False)
+        self.spk_unknown_chk = ttk.Checkbutton(top, text="Speak unknown (debug)", variable=self.spk_unknown_var, command=self.on_unknown_toggle)
+        self.spk_unknown_chk.pack(side="left", padx=(0, 10))
+
+        self.apply_btn = ttk.Button(top, text="Apply voice/model", command=self.apply_voice_model)
+        self.apply_btn.pack(side="left", padx=(4, 8))
+
+        self.test_btn = ttk.Button(top, text="🔊 Test TTS", command=self.on_test)
+        self.test_btn.pack(side="left", padx=(0, 6))
+
+        self.beep_btn = ttk.Button(top, text="🔔 Beep", command=self.on_beep)
+        self.beep_btn.pack(side="left")
+
+        # --- Status + last line ---
+        self.status_var = tk.StringVar(value="Loading hashed map…")
+        self.text_var = tk.StringVar(value="(waiting for dialogue)")
+        self.err_var = tk.StringVar(value="")
+        self.tts_info_var = tk.StringVar(value="")
+
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(self.root, text="Last line:").pack(anchor="w", padx=8, pady=(6, 2))
+        self.text_lbl = tk.Label(self.root, textvariable=self.text_var, wraplength=880, justify="left")
+        self.text_lbl.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+
+        ttk.Label(self.root, textvariable=self.err_var, foreground="#cc3333").pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(self.root, textvariable=self.tts_info_var, foreground="#555").pack(fill="x", padx=8, pady=(0, 8))
+
+        # Load hashed-with-gender map
+        load_hashed_map(HASHMAP_PATH)
+        self.status_var.set(f"Loaded {len(HASH_TO_GENDER)} known dialogs.")
+
+        # Init TTS backend (only if key already provided)
+        api_key = self.key_var.get().strip()
+        if api_key:
+            try:
+                persist_dir = TTS_CACHE_DIR if self.save_wav_var.get() else None
+                self.speaker = OpenAITTSSpeaker(api_key=api_key,
+                                                model=self.model_var.get(),
+                                                voice=self.voice_var.get(),
+                                                persist_dir=persist_dir)
+                self.status_var.set("OpenAI TTS ready")
+            except Exception as e:
+                self.speaker = None
+                self.status_var.set(f"⚠️ TTS init error: {e}")
+        else:
+            self.speaker = None
+            self.status_var.set("Provide API key and click 'Apply API key'.")
+
+        # Disable voice UI if no TTS
+        self.set_voice_controls_state(state=("normal" if self.speaker else "disabled"))
+
+        # Start worker
+        self.ui_queue = queue.Queue()
+        self.worker = SpeakerWorker(self.ui_queue, self.speaker)
+        self.worker.enabled = self.enabled_var.get()
+        self.worker.speak_unknown = self.spk_unknown_var.get()
+        self.worker.male_voice = self.male_voice_var.get()
+        self.worker.female_voice = self.female_voice_var.get()
+        self.worker.start()
+
+        # Bind voice comboboxes -> worker prefs
+        self.male_voice_cb.bind("<<ComboboxSelected>>", lambda e: self.update_worker_voices())
+        self.female_voice_cb.bind("<<ComboboxSelected>>", lambda e: self.update_worker_voices())
+        self.voice_cb.bind("<<ComboboxSelected>>", lambda e: self.apply_voice_model())
+
+        # UI timers & close protocol
+        self.root.after(120, self.pump_ui)
+        self.root.after(600, self.poll_tts_status)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Optional hotkey: Ctrl+Shift+S toggles Speak
+        try:
+            keyboard.add_hotkey('ctrl+shift+s', self.toggle_speak_hotkey)
+        except Exception:
+            pass
+
+    # ----- UI helpers -----
+    def set_voice_controls_state(self, state: str):
+        self.voice_cb.configure(state="readonly" if state == "normal" else "disabled")
+        self.model_entry.configure(state=state)
+        self.apply_btn.configure(state=state)
+        self.test_btn.configure(state=state)
+        self.beep_btn.configure(state=state)
+        self.male_voice_cb.configure(state="readonly" if state == "normal" else "disabled")
+        self.female_voice_cb.configure(state="readonly" if state == "normal" else "disabled")
+
+    def update_worker_voices(self):
+        if self.worker:
+            self.worker.male_voice = self.male_voice_var.get()
+            self.worker.female_voice = self.female_voice_var.get()
+
+    def apply_api_key(self):
+        key = self.key_var.get().strip()
+        if not key:
+            self.err_var.set("API key is empty.")
+            return
+        if self.speaker is None:
+            try:
+                persist_dir = TTS_CACHE_DIR if self.save_wav_var.get() else None
+                self.speaker = OpenAITTSSpeaker(api_key=key,
+                                                model=self.model_var.get(),
+                                                voice=self.voice_var.get(),
+                                                persist_dir=persist_dir)
+                self.worker.speaker = self.speaker
+                self.status_var.set("OpenAI TTS ready")
+                self.set_voice_controls_state("normal")
+                self.err_var.set("")
+            except Exception as e:
+                self.status_var.set(f"⚠️ TTS init error: {e}")
+                self.err_var.set(str(e))
+        else:
+            self.speaker.set_api_key(key)
+            self.status_var.set("API key updated for current session.")
+            self.err_var.set("")
+
+    def on_save_wav_toggle(self):
+        if not self.speaker:
+            return
+        if self.save_wav_var.get():
+            try:
+                os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+            except Exception as e:
+                self.err_var.set(f"Cannot create folder: {e}")
+                return
+            self.speaker.set_persist_dir(TTS_CACHE_DIR)
+            self.status_var.set(f"Saving WAVs to {TTS_CACHE_DIR}")
+        else:
+            self.speaker.set_persist_dir(None)
+            self.status_var.set("WAV saving disabled")
+
+    def open_wav_folder(self):
+        try:
+            os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+            subprocess.Popen(["explorer", TTS_CACHE_DIR])
+        except Exception as e:
+            self.err_var.set(f"Open folder failed: {e}")
+
+    def toggle_speak_hotkey(self):
+        self.enabled_var.set(not self.enabled_var.get())
+        self.on_enabled_toggle()
+
+    def on_enabled_toggle(self):
+        self.worker.enabled = self.enabled_var.get()
+        self.status_var.set(f"Speaking {'enabled' if self.worker.enabled else 'disabled'}")
+
+    def on_unknown_toggle(self):
+        self.worker.speak_unknown = self.spk_unknown_var.get()
+        self.status_var.set(f"Speak unknown: {'ON' if self.worker.speak_unknown else 'OFF'}")
+
+    def apply_voice_model(self):
+        if not self.speaker:
+            return
+        v = self.voice_var.get().strip()
+        m = self.model_var.get().strip()
+        if v in OPENAI_VOICES:
+            self.speaker.set_voice(v)
+        self.speaker.set_model(m or OPENAI_DEFAULT_MODEL)
+        self.status_var.set(f"Voice set to '{self.speaker.voice}', model '{self.speaker.model}'")
+
+    def on_test(self):
+        if not self.speaker:
+            self.err_var.set("No TTS backend. Provide API key.")
+            return
+        msg = f"Test voix {self.speaker.voice}. Bonjour, ceci est un test."
+        self.speaker.speak(msg)
+
+    def on_beep(self):
+        try:
+            winsound.Beep(880, 180)
+            winsound.Beep(660, 180)
+        except Exception as e:
+            self.err_var.set(f"Beep failed: {e}")
+
+    def poll_tts_status(self):
+        if self.speaker:
+            if self.speaker.last_error:
+                self.err_var.set(self.speaker.last_error[:300])
+            else:
+                self.err_var.set("")
+            if self.speaker.last_path:
+                self.tts_info_var.set(f"Last WAV: {self.speaker.last_path} ({self.speaker.last_size} bytes)")
+        else:
+            self.tts_info_var.set("")
+        self.root.after(900, self.poll_tts_status)
+
+    def pump_ui(self):
+        try:
+            while True:
+                msg = self.ui_queue.get_nowait()
+                if "status" in msg:
+                    self.status_var.set(msg["status"])
+                if "text_preview" in msg:
+                    self.text_var.set(msg["text_preview"] or "(waiting for dialogue)")
+                if "spoken" in msg:
+                    self.status_var.set(f"Speaking: {msg['spoken'][:80]}{'…' if len(msg['spoken'])>80 else ''}")
+        except queue.Empty:
+            pass
+        self.root.after(120, self.pump_ui)
+
+    def on_close(self):
+        try:
+            self.worker.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.speaker, "stop"):
+                self.speaker.stop()
+        except Exception:
+            pass
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+        self.root.destroy()
+
+# =========================================================
+def main():
+    app = App()
+    app.root.mainloop()
+
+if __name__ == "__main__":
+    main()
