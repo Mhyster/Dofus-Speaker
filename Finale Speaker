@@ -3,6 +3,7 @@ import time
 import re
 import threading
 import queue
+from typing import Optional
 import pymem
 import pymem.process
 import pyttsx3
@@ -74,7 +75,7 @@ SENT_SPLIT = re.compile(r'(?<=[\.\!\?…])\s+')
 def ensure_space_after_punct(text: str) -> str:
     return re.sub(r'([\.!\?…])(?=\S)', r'\1 ', text)
 
-def clean_npc_text(buf: str, max_sentences: int = 2) -> str:
+def clean_npc_text(buf: str, max_sentences: Optional[int] = None) -> str:
     first_tag = buf.find("<")
     first_chat = buf.find("\n[")
     true_pos = buf.find('True">')
@@ -117,7 +118,7 @@ def clean_npc_text(buf: str, max_sentences: int = 2) -> str:
         if s[0].isalpha() and s[0].islower():
             break
         result.append(s)
-        if len(result) >= max_sentences:
+        if max_sentences is not None and len(result) >= max_sentences:
             break
 
     clean = " ".join(result).strip()
@@ -153,6 +154,7 @@ class SpeakerWorker(threading.Thread):
         self.MIN_DWELL = 0.20           # seconds new text must persist
 
         self.pm = None
+        self.last_string_addr = 0
 
     def send_ui(self, **payload):
         self.ui_queue.put(payload)
@@ -185,7 +187,12 @@ class SpeakerWorker(threading.Thread):
                 )
                 raw = read_utf16(self.pm, string_addr)
             except Exception:
+                string_addr = 0
                 raw = ""
+
+            if string_addr != self.last_string_addr:
+                self._reset_state(allow_same=True)
+                self.last_string_addr = string_addr
 
             npc = clean_npc_text(raw)
             preview = npc if len(npc) < 160 else (npc[:157] + "…")
